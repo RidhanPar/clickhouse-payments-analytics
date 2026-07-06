@@ -33,6 +33,23 @@ services:
       timeout: 3s
       retries: 12
 
+  # Continuous event stream: generates payment events against the seeded
+  # merchant book and batch-inserts them into payments.events. Runs forever.
+  producer:
+    build: ./producer
+    container_name: payments-producer
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analytics_local}
+      EVENTS_PER_SECOND: ${EVENTS_PER_SECOND:-25}
+      FLUSH_INTERVAL_SECONDS: ${FLUSH_INTERVAL_SECONDS:-5}
+      ANOMALY_EVERY_MINUTES: ${ANOMALY_EVERY_MINUTES:-15}
+      ANOMALY_DURATION_MINUTES: ${ANOMALY_DURATION_MINUTES:-7}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
   superset-metadata-db:
     image: postgres:15-alpine
     container_name: superset-metadata-db
