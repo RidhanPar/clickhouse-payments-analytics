@@ -35,3 +35,18 @@ Measured on this machine (Docker Desktop on Windows, ClickHouse 24.8):
 | On-disk size (transactions) | 6.41 MiB compressed (15.14 MiB uncompressed) |
 
 The materialized view target ends up with 372,370 rows against 575,226 in the base table, a modest 1.5x reduction at this data density (many merchants transact less than daily). The reduction grows with volume; the point of the pattern is that the aggregate table grows with merchants times days while the base table grows with transactions.
+
+## Dashboard
+
+The "Payments Portfolio Overview" dashboard recreates the core views from the segmentation project as Superset charts running directly on ClickHouse:
+
+| Chart | Source | Query shape |
+|---|---|---|
+| Transaction volume over time | `transactions` | monthly `count(*)` |
+| Failure rate by merchant segment | virtual dataset joining `transactions` to the `merchant_segments` view | `countIf(status = 'Failed') / count(*)` per segment |
+| Top merchants by processed volume | `transactions` | `sumIf(amount, status = 'Success')` per merchant, top 15 |
+| Daily failed transactions | `daily_merchant_stats` (materialized view target) | `sum(failed_count)` per day, aggregating again at read time as SummingMergeTree requires |
+
+The dashboard is built by [scripts/build_dashboard.py](scripts/build_dashboard.py) through the Superset REST API, so the entire definition is reviewable code, and the result is exported to [superset/exports/payments_portfolio_dashboard.zip](superset/exports/payments_portfolio_dashboard.zip). To reproduce on a fresh stack, either re-run the script or import the zip in the Superset UI (Dashboards, Import). Superset masks database passwords in exports, so an import prompts for the ClickHouse password (`analytics_local` unless changed in `.env`).
+
+Screenshots: to be added under `docs/img/` after review.
