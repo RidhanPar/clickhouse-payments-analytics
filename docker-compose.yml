@@ -23,6 +23,10 @@ services:
       - clickhouse_data:/var/lib/clickhouse
       # Schema DDL, applied automatically on first start (empty data volume).
       - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      # Backup destination (docs/OPERATIONS.md). Single-file mount so the
+      # image's own config.d entries stay untouched.
+      - ./clickhouse/config.d/backups.xml:/etc/clickhouse-server/config.d/backups.xml:ro
+      - clickhouse_backups:/backups
     ulimits:
       nofile:
         soft: 262144
@@ -49,6 +53,15 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    # The producer touches /tmp/heartbeat after every successful flush, so
+    # "no committed insert for 30s" flips the container unhealthy even while
+    # the Python process is still alive and retrying.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, time, sys; sys.exit(0 if time.time() - os.path.getmtime('/tmp/heartbeat') < 30 else 1)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 45s
+      retries: 3
 
   superset-metadata-db:
     image: postgres:15-alpine
@@ -109,5 +122,6 @@ services:
 
 volumes:
   clickhouse_data:
+  clickhouse_backups:
   superset_metadata:
   superset_home:
