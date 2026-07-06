@@ -1,91 +1,96 @@
 # Schema Design
 
-DDL lives in [clickhouse/init/](../clickhouse/init/). This document explains the decisions, in the order they were made: query patterns first, then engine, then sort key, then everything else. That ordering matters because in ClickHouse the physical layout is the schema design; get the sort key wrong and no index added later will save you.
+DDL lives in [clickhouse/init/](../clickhouse/init/), applied automatically on the first container start. This document explains the decisions in the order they were made: storage strategy first, then query patterns, then engines and keys. In ClickHouse the physical layout is the schema design; get the sort key or the retention story wrong and no amount of tuning later saves you.
 
-## Start from the query patterns
+## The storage strategy: raw expires, rollups are forever
 
-The dashboards ask four kinds of questions:
+The live system stores payment data at three grains with three lifetimes:
 
-1. Transaction volume and value over time (portfolio-wide, by day or month)
-2. Failure rate by merchant segment
-3. Top merchants by processed volume
-4. Daily failures per merchant (the operations view)
+| Table | Grain | Engine | Retention | Grows with |
+|---|---|---|---|---|
+| `events` | one row per payment event | MergeTree | 90 days (TTL) | traffic |
+| `platform_minute_stats` | per minute, platform wide | AggregatingMergeTree | 90 days (TTL) | time |
+| `daily_merchant_stats` | per merchant per day | SummingMergeTree | forever | merchants x days |
 
-Three of the four aggregate by merchant, and everything filters or groups by time. So the workload is: scan many rows, few columns (`merchant_id`, `transaction_date`, `amount`, `status`), aggregate hard. That is the exact shape columnar storage is built for, and it drives every choice below.
+This split is the answer to the only storage question that matters for a stream: raw events grow with traffic and would grow without bound, but almost every question asked of data older than a few weeks is an aggregate question. So raw events live 90 days for drill down and incident investigation, and the daily rollup (which grows at a bounded, predictable rate: 3,000 merchants times 365 days is about 1M small rows a year at worst) is the permanent record. Losing raw events past 90 days is a deliberate, documented trade, not an accident.
+
+## Query patterns
+
+Two workloads now, not one:
+
+**Operational (seconds to hours old):** volume and failure rate right now, per minute trend over the last few hours, which merchants are failing abnormally. Hits `events` and `platform_minute_stats`, refreshed every 30 seconds by the live dashboard.
+
+**Historical (days to years):** monthly volume trends, merchant segmentation, top merchants over a quarter. Hits `daily_merchant_stats` exclusively; it never needs raw events.
+
+Both workloads scan many rows, touch few columns, and aggregate hard, which is the shape columnar storage is built for.
 
 ## Why MergeTree
 
-`MergeTree` is ClickHouse's workhorse table engine. Data arrives in sorted immutable parts, each column stored as its own compressed file, and background threads merge small parts into bigger ones. Three properties matter for this workload:
+`MergeTree` is ClickHouse's workhorse table engine. Data arrives in sorted immutable parts, each column stored as its own compressed file, and background threads merge small parts into bigger ones. Three properties matter here:
 
-- **Columnar reads.** A query touching 4 of the 7 columns reads roughly 4/7 of the bytes, and in practice far less because sorted, low variety columns compress extremely well.
-- **A sparse primary index.** MergeTree does not index every row. It stores one index entry per granule (8,192 rows by default), which keeps the whole index in memory and makes range scans cheap.
-- **Ordered storage.** Rows are physically sorted by the `ORDER BY` key, so rows that are queried together sit together on disk.
+- **Columnar reads.** A query touching 4 of 7 columns reads roughly 4/7 of the bytes, in practice far less because sorted, low variety columns compress extremely well.
+- **A sparse primary index.** One index entry per granule (8,192 rows by default), so the whole index stays in memory and range scans are cheap.
+- **Ordered storage.** Rows sort physically by the `ORDER BY` key, so rows queried together sit together on disk.
 
-The specialized engines (`ReplacingMergeTree`, `SummingMergeTree`, and others) are all MergeTree variants with extra merge time behavior. The base table needs none of that: transactions are immutable facts, inserted once, never updated. Plain `MergeTree` is the correct default and anything fancier would need justifying, not the other way round.
+The merge process is also what makes TTL and the aggregating engines work, which is why every specialized engine below is a MergeTree variant: they are all hooks into the same merge machinery.
 
-## The ORDER BY key
-
-```sql
-ORDER BY (merchant_id, transaction_date)
-```
-
-In MergeTree the `ORDER BY` clause is the primary index (there is no separate `PRIMARY KEY` here, it defaults to the sort key). The sparse index stores the key values at each granule boundary, so a filter on a key prefix lets ClickHouse skip every granule whose key range cannot match.
-
-Why `merchant_id` first:
-
-- The dominant pattern is merchant level aggregation over time. With this key, all rows for one merchant are physically contiguous and sorted by date inside that run. A query like "daily volume for merchant X in Q1" reads a handful of granules instead of scanning the table.
-- Cardinality ordering: the useful rule is lower cardinality columns first when queries filter on them. 3,000 merchants split the table into 3,000 sorted runs; within each, dates sort ascending. Both key columns stay usable.
-
-Why not `transaction_date` first: it would optimize "everything on date D" at the cost of scattering each merchant's rows across the entire table, which turns every merchant scoped query into a full scan. Portfolio wide time queries do not need the sort key anyway, because partition pruning (next section) already cuts them down by month, and a full scan of 575K rows takes ClickHouse milliseconds regardless. The sort key is spent on the access pattern that benefits most.
-
-`transaction_id` is deliberately not in the key. It is a row identifier nobody filters by, and a unique first key column would destroy the compression that comes from sorted repetition.
-
-## Partitioning
+## The events table
 
 ```sql
-PARTITION BY toYYYYMM(transaction_date)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (merchant_id, event_time)
+TTL event_time + INTERVAL 90 DAY
+SETTINGS ttl_only_drop_parts = 1
 ```
 
-Partitions are for data management and coarse pruning, not query speed within a month. 24 months of data gives 24 partitions, so any query with a date range filter skips whole months before the primary index is even consulted, and dropping old data (`ALTER TABLE ... DROP PARTITION`) is instant. A common beginner mistake is partitioning by day, which creates thousands of tiny parts and slows everything down; months are the right grain at this volume.
+**ORDER BY (merchant_id, event_time).** The dominant per-row access pattern is merchant scoped: "show me merchant X's events in this window" during an incident, and the anomaly detector's per-merchant recent windows. With this key each merchant is one contiguous sorted run per part. Platform wide time queries do not need the sort key: partition pruning cuts them to the touched months, and the per-minute rollup answers most of them anyway. The key is spent on the access pattern that has no other index to fall back on. `transaction_id` stays out of the key: it is an identifier nobody filters by, and a unique leading column would destroy the compression that sorted repetition buys.
+
+**PARTITION BY month, decided at creation.** Partitions give coarse pruning for time ranges and instant data management (`DROP PARTITION`). Monthly is the right grain: day partitions at this volume would create thousands of tiny parts. The reason partitioning happened in the producer PR rather than the hardening PR is that ClickHouse cannot change a table's partitioning afterwards; it requires a full rebuild (new table, `INSERT SELECT`, rename swap). Partitioning is a birth decision.
+
+**TTL, added later on purpose.** `TTL event_time + INTERVAL 90 DAY` was added to the live table with `ALTER TABLE ... MODIFY TTL`, a metadata-only operation, which is exactly why retention did not need to be decided at creation. TTL deletes during merges, so expiry is eventual, not on the dot of day 90; a part whose newest row expired yesterday may sit on disk until the next merge touches it. `ttl_only_drop_parts = 1` tells ClickHouse to wait until an entire part has expired and then drop the part whole (nearly free) instead of rewriting parts to delete rows out of their middle (a full part rewrite). With monthly partitions and a 90 day TTL, parts age out cleanly a month at a time.
 
 ## Column types
 
 | Column | Type | Why |
 |---|---|---|
-| `merchant_id` | `LowCardinality(String)` | 3,000 distinct values. Dictionary encoding stores each string once and 2 byte codes in the data, which shrinks the column and speeds GROUP BY. The guidance is that LowCardinality pays off below roughly 10K distinct values. |
+| `merchant_id` | `LowCardinality(String)` | 3,000 distinct values. Dictionary encoding stores each string once and 2 byte codes in the data. Pays off below roughly 10K distinct values. |
 | `payment_method`, `failure_reason` | `LowCardinality(String)` | 3 and 5 distinct values. Same reasoning, stronger effect. |
-| `status` | `Enum8` | Two known states, stored as one byte, and the schema rejects typos like 'Sucess' at insert time. |
-| `amount` | `Decimal(18,2)` | Money. Floats accumulate rounding error under aggregation; a `sum()` over half a million floats can drift cents. Decimal arithmetic is exact. |
-| `transaction_date` | `Date` | 2 bytes. The source data has day precision, so `DateTime` would waste 2 bytes per row pretending to precision that does not exist. |
-| `failure_reason` default `''` | not `Nullable` | Nullable columns carry a separate null mask file per part and add branching to every read. An empty string is an unambiguous "no failure" here, so the null machinery buys nothing. |
+| `status` | `Enum8` | Two known states, one byte, and the schema rejects typos at insert time. |
+| `amount` | `Decimal(18,2)` | Money. Floats drift under aggregation; Decimal arithmetic is exact. |
+| `event_time` | `DateTime` | Second precision, 4 bytes. The historical dataset only carried dates; a live system needs minutes and seconds. |
+| `failure_reason` default `''` | not `Nullable` | Nullable adds a null mask file per part and branching to reads. Empty string is an unambiguous "no failure". |
 
-## The materialized view
+## Materialized views: the real-time aggregates
 
-```sql
-CREATE MATERIALIZED VIEW payments.daily_merchant_stats_mv
-TO payments.daily_merchant_stats AS
-SELECT transaction_date AS day, merchant_id,
-       count() AS txn_count,
-       countIf(status = 'Failed') AS failed_count,
-       sumIf(amount, status = 'Success') AS success_amount
-FROM payments.transactions
-GROUP BY day, merchant_id;
-```
+A ClickHouse materialized view is an **insert trigger, not a scheduled refresh**. Every block inserted into `events` passes through the view's SELECT and the partial aggregate lands in the target table. Two consequences drive everything below:
 
-The single most misunderstood ClickHouse feature, so precision matters:
+1. An MV never re-reads existing data. Backfilling history means inserting directly into the target table (`INSERT INTO target SELECT ... ` shaped like the MV query), which is what [scripts/backfill_history.py](../scripts/backfill_history.py) does.
+2. The target holds partial aggregates from different insert blocks. Merges combine them eventually, so correct reads always re-aggregate (`sum(...) GROUP BY ...`). A raw `SELECT *` silently undercounts. Every dashboard query in this repo aggregates.
 
-- **It is an insert trigger, not a scheduled refresh.** Every block inserted into `transactions` passes through the SELECT, and the partial aggregate for that block is appended to the target table. It never re-reads existing data, which also means it must be created before the data load (or backfilled explicitly with `INSERT INTO ... SELECT`).
-- **The target is `SummingMergeTree`.** Partial results for the same `(merchant_id, day)` arrive from different insert blocks as separate rows; this engine sums the numeric columns of rows with an identical sort key during background merges.
-- **Queries must still aggregate.** Merges are eventual, so at any moment the target may hold several unmerged rows per key. Correct reads are always `sum(txn_count) ... GROUP BY`, never a raw `SELECT *`. Getting this wrong produces silently understated numbers, which is exactly the kind of bug a BI layer bakes into a dashboard, so the dashboard queries in this repo always aggregate.
+### platform_minute_stats: AggregatingMergeTree
 
-Why this view exists: the daily failures dashboard panel asks "failures per day, filterable by merchant" on every refresh. Against the base table that is a 575K row scan each time; against the pre-aggregate it reads at most one row per merchant per day. At this data size both are fast, honestly. The benchmark section in the README quantifies the actual gap. The design earns its keep with scale: transaction tables grow by orders of magnitude, the daily aggregate grows only with merchants times days, and the pattern (raw immutable facts plus incrementally maintained aggregates) is the standard ClickHouse answer to dashboard latency.
+Per minute: transaction count, failure count, amount, and **distinct active merchants**. That last metric forces the engine choice. Counts and sums merge by addition, but distinct counts do not: 900 distinct merchants in one insert block plus 900 in another is not 1,800. Merging distinct counts requires keeping the intermediate HyperLogLog style state, which is what `AggregateFunction(uniq, String)` stores and what `AggregatingMergeTree` knows how to combine during merges. Reads finalize the state with `uniqMerge(active_merchants)`.
 
-Why `SummingMergeTree` and not `AggregatingMergeTree`: everything here is a count or a sum, which SummingMergeTree handles with plain numeric columns. AggregatingMergeTree with `AggregateFunction` state columns is the right tool once you need averages, uniques, or quantiles maintained incrementally; using it for plain sums adds complexity for nothing.
+The plain sums ride along as `SimpleAggregateFunction(sum, ...)` columns: stored as ordinary numbers, summed on merge, no state overhead. So the table uses full aggregate state only where the math demands it.
+
+### daily_merchant_stats: SummingMergeTree
+
+Per merchant per day: transaction count, failure count, successful amount. Every column is a count or a sum, all of which merge by plain addition, so `SummingMergeTree` (which sums numeric columns of rows sharing a sort key during merges) is sufficient and simpler: plain numeric columns, readable without merge functions, no aggregate states to understand. `AggregatingMergeTree` earns its complexity only when something cannot be summed; using it here would be engine cosplay.
+
+This table is fed twice: by the MV for the live stream, and by the backfill for the 24 months of generated history. The backfill window (2024-07 through 2026-06) aligns exactly with the table's monthly partitions, so re-running the backfill drops those partitions and reloads them, never touching partitions the live stream writes into. Aligning partition keys with reload units is what makes backfills safely repeatable.
 
 ## The segments view
 
-`payments.merchant_segments` is a plain view (computed at query time) that translates the RFM segmentation from my [payment-merchant-clv-segmentation](https://github.com/RidhanPar/payment-merchant-clv-segmentation) project into SQL: quintile scores via `ntile(5)` window functions over recency, frequency, and monetary value, then the same rule table mapping scores to segments (Champions, Loyal, New, Needs Attention, At Risk, Dormant). Only successful transactions count toward frequency and monetary value, matching the original.
+`merchant_segments` translates the RFM segmentation from my [payment-merchant-clv-segmentation](https://github.com/RidhanPar/payment-merchant-clv-segmentation) project into SQL over the daily rollup: quintile scores via `ntile(5)`, then the original rule table mapping score combinations to segments. It reads `daily_merchant_stats` rather than raw events because RFM needs each merchant's full lifetime and raw events expire at 90 days. Daily grain loses nothing: R has day precision by definition, F and M are sums.
 
-Not materialized, on purpose: after aggregation it is one row per merchant, 3,000 rows. ClickHouse computes it in milliseconds, and a live view always reflects the latest loaded data. Materializing it would add merge time machinery to save nothing.
+Two details earned their place through actual failures during development:
 
-One ClickHouse specific detail: with default settings a `LEFT JOIN` fills non matches with type defaults rather than NULLs, so a merchant with no successful transactions gets `last_success_date = 1970-01-01`. The view checks for that epoch value and substitutes the merchant's signup date, so "never converted" merchants get the worst recency instead of a nonsense 56 year gap.
+- **Quintile tie breaking.** On a live platform most of the active book transacted yesterday, so recency ties across thousands of merchants. `ntile` splits ties by arbitrary row order, which turned R scores into noise (Champions collapsed from 553 to 22 the first time the view ran against live data). The window now orders by recency, then frequency, then monetary: deterministic, and defensible as "among equally recent merchants, the busier one ranks higher".
+- **SummingMergeTree safe recency.** "Last day with a success" is computed as `maxIf(day, txn_count > failed_count)` over possibly unmerged partial rows. This is merge safe because each partial row aggregates one insert block and is internally consistent: a block containing at least one success necessarily has `txn_count > failed_count`.
+
+Still a plain view: 3,000 output rows, milliseconds to compute, always current.
+
+## The legacy transactions table
+
+The original `payments.transactions` table (day precision, bulk loaded) is superseded by this pipeline: its history now lives in `daily_merchant_stats` via the backfill, and its role as dashboard source ends when the dashboards repoint to the live tables. It is no longer created for fresh clones and will be dropped from the running instance in the dashboard migration stage.
