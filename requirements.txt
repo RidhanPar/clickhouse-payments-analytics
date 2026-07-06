@@ -1,0 +1,4 @@
+# For the load and benchmark scripts (the stack itself needs only Docker).
+clickhouse-connect>=0.8
+pandas>=2.0
+numpy>=1.24
