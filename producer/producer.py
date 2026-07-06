@@ -69,16 +69,31 @@ def get_client():
 
 def load_merchants(client):
     """The producer refuses to invent merchants: it streams against the book
-    seeded by the backfill, so live data joins cleanly with history. Retries
-    until the dimension table has rows."""
+    seeded by the backfill, so live data joins cleanly with history.
+
+    Traffic weights come from each merchant's actual volume over the trailing
+    90 days of recorded history, not from the static weekly_txn_rate column.
+    The difference matters: about a fifth of the generated book churned
+    partway through history, and weighting by the static rate would resurrect
+    every dead merchant the moment the stream starts, which destroys recency
+    based segmentation. Merchants with no recent activity get no live
+    traffic; the stream continues the book as it last behaved."""
     while True:
         rows = client.query(
-            "SELECT merchant_id, avg_ticket_size, weekly_txn_rate, decline_rate "
-            "FROM payments.merchants"
+            """SELECT m.merchant_id, m.avg_ticket_size, w.recent_txns, m.decline_rate
+               FROM payments.merchants AS m
+               INNER JOIN
+               (
+                   SELECT merchant_id, sum(txn_count) AS recent_txns
+                   FROM payments.daily_merchant_stats
+                   WHERE day >= (SELECT max(day) - 90 FROM payments.daily_merchant_stats)
+                   GROUP BY merchant_id
+                   HAVING recent_txns > 0
+               ) AS w USING (merchant_id)"""
         ).result_rows
         if rows:
             return rows
-        log.warning("merchants table is empty; run scripts/load_data.py. Retrying in 10s")
+        log.warning("no merchant history found; run scripts/backfill_history.py. Retrying in 10s")
         time.sleep(10)
 
 
@@ -160,7 +175,7 @@ def make_event(merchants, cum_weights, anomaly):
 def main():
     client = get_client()
     merchants = load_merchants(client)
-    weights = [float(m[2]) for m in merchants]  # weekly_txn_rate as traffic share
+    weights = [float(m[2]) for m in merchants]  # trailing 90 day volume as traffic share
     cum_weights = []
     total = 0.0
     for w in weights:
