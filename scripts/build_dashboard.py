@@ -36,6 +36,7 @@ CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "analytics_local")
 DB_NAME = "ClickHouse payments"
 OPS_DASHBOARD = "Payments Operations (Live)"
 HISTORY_DASHBOARD = "Payments History"
+MONITORING_DASHBOARD = "System Monitoring"
 EXPORT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "superset", "exports", "payments_dashboards.zip",
@@ -64,6 +65,22 @@ SELECT
     s.segment
 FROM payments.daily_merchant_stats AS d
 INNER JOIN payments.merchant_segments AS s USING (merchant_id)
+"""
+
+# Storage health straight from ClickHouse's own bookkeeping. Active part
+# counts are the first thing to look at when inserts misbehave: a table
+# accumulating hundreds of parts means batching is broken somewhere.
+SYSTEM_PARTS_SQL = """\
+SELECT
+    table,
+    count()                                              AS active_parts,
+    sum(rows)                                            AS rows,
+    round(sum(data_compressed_bytes) / 1048576, 2)       AS compressed_mib,
+    round(sum(data_uncompressed_bytes) / 1048576, 2)     AS uncompressed_mib
+FROM system.parts
+WHERE database = 'payments' AND active
+GROUP BY table
+ORDER BY rows DESC
 """
 
 
@@ -171,8 +188,9 @@ def build_query_context(dataset_id, params):
         "row_limit": params.get("row_limit", 10000),
         "extras": {"having": "", "where": where},
     }
-    if params.get("metrics"):
-        query["metrics"] = params["metrics"]
+    metrics = params.get("metrics") or ([params["metric"]] if params.get("metric") else None)
+    if metrics:
+        query["metrics"] = metrics
     if params.get("time_grain_sqla"):
         query["extras"]["time_grain_sqla"] = params["time_grain_sqla"]
     if params.get("series_limit_metric"):
@@ -408,14 +426,51 @@ def main():
     ])
     print(f"History dashboard assembled (id {hist_id})")
 
+    # ---- System monitoring dashboard (the stack watching itself) ----
+    ds_parts = ensure_dataset(api, db_id, "system_parts", sql=SYSTEM_PARTS_SQL)
+
+    mon = {}
+    mon["rate"] = ensure_chart(
+        api, "Ingestion rate (rows per minute)", ds_minute, "echarts_timeseries_bar", {
+            "x_axis": "minute",
+            "time_grain_sqla": "PT1M",
+            "metrics": [metric_sql("sum(txn_count)", "Rows ingested")],
+            "adhoc_filters": [sql_filter("minute > now() - INTERVAL 60 MINUTE")],
+            "row_limit": 10000,
+        })
+    # Lag = wall clock minus newest event in the raw table. Covers the whole
+    # path: producer generating, buffering, inserting, part committed.
+    mon["lag"] = ensure_chart(
+        api, "Ingestion lag", ds_events, "big_number_total", {
+            "metric": metric_sql("dateDiff('second', max(event_time), now())",
+                                 "Seconds behind wall clock"),
+            "subheader": "seconds between now() and max(event_time); healthy is under ~15s (flush interval + insert)",
+        })
+    mon["parts"] = ensure_chart(
+        api, "Storage: active parts and size per table", ds_parts, "table", {
+            "query_mode": "raw",
+            "all_columns": ["table", "active_parts", "rows",
+                            "compressed_mib", "uncompressed_mib"],
+            "order_by_cols": ['["rows", false]'],
+            "row_limit": 20,
+        })
+
+    mon_id = ensure_dashboard(api, MONITORING_DASHBOARD, [
+        [chart_component(mon["rate"], "Ingestion rate (rows per minute)", 8, 50),
+         chart_component(mon["lag"], "Ingestion lag", 4, 50)],
+        [chart_component(mon["parts"], "Storage: active parts and size per table", 12, 40)],
+    ], refresh_frequency=30)
+    print(f"Monitoring dashboard assembled (id {mon_id})")
+
     os.makedirs(os.path.dirname(EXPORT_PATH), exist_ok=True)
-    export = api.get("/dashboard/export/", params={"q": f"!({ops_id},{hist_id})"})
+    export = api.get("/dashboard/export/", params={"q": f"!({ops_id},{hist_id},{mon_id})"})
     with open(EXPORT_PATH, "wb") as f:
         f.write(export.content)
-    print(f"Exported both dashboards to {os.path.relpath(EXPORT_PATH)} "
+    print(f"Exported all dashboards to {os.path.relpath(EXPORT_PATH)} "
           f"({len(export.content):,} bytes)")
     print(f"Operations: {BASE}/superset/dashboard/{ops_id}/")
     print(f"History:    {BASE}/superset/dashboard/{hist_id}/")
+    print(f"Monitoring: {BASE}/superset/dashboard/{mon_id}/")
 
 
 if __name__ == "__main__":
