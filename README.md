@@ -11,3 +11,27 @@ Built in stages, one pull request per stage:
 5. Query benchmarks
 
 See [docs/SETUP.md](docs/SETUP.md) for how the stack is configured and [docs/SCHEMA.md](docs/SCHEMA.md) for the schema reasoning.
+
+## Dataset and load
+
+The generator is copied unchanged from the segmentation project (seeded with `numpy` seed 42, so every run produces the identical dataset): 3,000 merchants with lognormal ticket sizes and activity rates, industry dependent decline rates, and a churned subset, producing 575,226 transactions across 24 months.
+
+```bash
+pip install -r requirements.txt
+py -3.11 scripts/load_data.py
+```
+
+The script generates the data in memory and inserts it over the HTTP interface in 100K row batches. Batching matters in ClickHouse: every insert becomes an immutable part on disk, so small frequent inserts create part counts that stall background merges. The load also verifies afterwards that the materialized view row counts match the base table.
+
+Measured on this machine (Docker Desktop on Windows, ClickHouse 24.8):
+
+| Metric | Value |
+|---|---|
+| Transactions loaded | 575,226 |
+| Merchants loaded | 3,000 |
+| Insert wall time | 2.92 s |
+| Insert throughput | ~197,000 rows/s |
+| Overall failure rate | 6.74% |
+| On-disk size (transactions) | 6.41 MiB compressed (15.14 MiB uncompressed) |
+
+The materialized view target ends up with 372,370 rows against 575,226 in the base table, a modest 1.5x reduction at this data density (many merchants transact less than daily). The reduction grows with volume; the point of the pattern is that the aggregate table grows with merchants times days while the base table grows with transactions.
