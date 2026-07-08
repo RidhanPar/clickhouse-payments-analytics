@@ -2,14 +2,24 @@
 -- above their own expected rate.
 --
 -- Method: for each merchant with at least 20 events and 5 failures in the
--- last 15 minutes, a one-sided binomial z test against a per-merchant
--- baseline. Under baseline rate p, the failure rate of n current events has
--- standard deviation sqrt(p*(1-p)/n); a merchant is listed when observed
--- sits 3+ standard deviations above baseline AND at least 5 points above it
--- in absolute terms. The z threshold controls false positives across ~2,700
--- merchants; the absolute floor keeps statistically-significant-but-tiny
--- bumps on high volume merchants off the list, because 6.9% against a 6.7%
--- baseline is not something an operator should be paged for.
+-- last 15 minutes, a one-sided two-proportion z test against a per-merchant
+-- baseline. When the baseline is itself estimated from data, the test uses
+-- the pooled standard error sqrt(p*(1-p) * (1/n + 1/m)) with m baseline
+-- transactions; when the baseline is the configured prior it is treated as
+-- exact (the 1/m term drops). A merchant is listed at z >= 3.5 AND at least
+-- 5 points above baseline in absolute terms.
+--
+-- Both refinements were forced by observed false positives, not invented up
+-- front. The first end to end verification run listed 7 merchants alongside
+-- the injected burst, every one with a thin observed baseline (an hour or
+-- two of live data): treating a noisy baseline as exact inflates z exactly
+-- when the baseline is weakest, which the pooled error corrects. And with
+-- ~300 eligible merchants re-tested every dashboard refresh, a 3 sigma
+-- threshold fires on someone most of the time; 3.5 sigma cuts the chance
+-- rate ~10x while leaving real bursts (z of 20 and up) untouched. The
+-- absolute floor keeps statistically-significant-but-tiny bumps on high
+-- volume merchants off the list, because 6.9% against a 6.7% baseline is
+-- not something an operator should be paged for.
 --
 -- The baseline is a two-level hierarchy, and the reason is a false positive
 -- this view produced within minutes of first being turned on:
@@ -51,6 +61,7 @@ WITH
         SELECT
             merchant_id,
             sum(txns)               AS baseline_txns,
+            sum(failed)             AS baseline_failed,
             sum(failed) / sum(txns) AS observed_rate
         FROM
         (
@@ -85,12 +96,19 @@ FROM
         r.failure_rate_15m AS failure_rate_15m,
         if(t.baseline_txns >= 50, t.observed_rate, m.decline_rate) AS baseline_rate,
         if(t.baseline_txns >= 50, 'observed 7d', 'configured prior') AS baseline_source,
+        -- Pooled rate for the two-proportion test; equals the prior when the
+        -- baseline is configured rather than observed.
+        if(t.baseline_txns >= 50,
+           (r.failed_15m + t.baseline_failed) / (r.txns_15m + t.baseline_txns),
+           m.decline_rate) AS pooled_rate,
         (r.failure_rate_15m - baseline_rate)
-            / sqrt(greatest(baseline_rate * (1 - baseline_rate), 0.0001) / r.txns_15m)
+            / sqrt(greatest(pooled_rate * (1 - pooled_rate), 0.0001)
+                   * (1 / r.txns_15m
+                      + if(t.baseline_txns >= 50, 1 / t.baseline_txns, 0)))
             AS z_score
     FROM recent AS r
     LEFT JOIN trailing AS t USING (merchant_id)
     LEFT JOIN payments.merchants AS m USING (merchant_id)
 )
-WHERE z_score >= 3 AND failure_rate_15m >= baseline_rate + 0.05
+WHERE z_score >= 3.5 AND failure_rate_15m >= baseline_rate + 0.05
 ORDER BY z_score DESC;

@@ -68,24 +68,43 @@ The dashboard is built by [scripts/build_dashboard.py](scripts/build_dashboard.p
 
 Screenshots: to be added under `docs/img/` after review.
 
-## Benchmarks
+## Benchmarks (measured on the running system)
 
-Run by [scripts/benchmark.py](scripts/benchmark.py): median of 5 runs after a warmup, on Docker Desktop for Windows, ClickHouse 24.8, 575,226 row transactions table. Server execution comes from `system.query_log`; end to end includes the HTTP round trip through Docker's network stack, which adds a near constant ~45 ms on this machine and would be the first thing to investigate if these were user facing latencies.
+Run by [scripts/benchmark.py](scripts/benchmark.py) while the producer streamed: median of 5 runs after a warmup, Docker Desktop for Windows, ClickHouse 24.8. At benchmark time the stream had accumulated 657,686 raw events over roughly two days of running, alongside 380,877 daily rollup rows carrying 24 months of history. Server execution comes from `system.query_log`; end to end includes the HTTP round trip through Docker's network stack, which adds a near constant ~45 ms on this machine and would be the first thing to investigate if these were user facing latencies.
 
 | Query | Server execution | End to end (HTTP) | Rows read | Data read |
 |---|---|---|---|---|
-| Monthly volume and value, full 24 months | 8 ms | 54 ms | 575,226 | 5.49 MiB |
-| One merchant's daily history (primary key hit) | 10 ms | 61 ms | 171,872 | 1.36 MiB |
-| Top 15 merchants by successful volume | 16 ms | 59 ms | 575,226 | 6.03 MiB |
-| Failure reasons in Q1 2026 (partition pruning) | 5 ms | 49 ms | 114,831 | 448.56 KiB |
-| Daily failures from the base table | 6 ms | 52 ms | 575,226 | 1.65 MiB |
-| Daily failures from the materialized view | 5 ms | 52 ms | 372,370 | 3.55 MiB |
-| Full RFM segmentation, computed live | 24 ms | 71 ms | 578,250 | 7.14 MiB |
+| Per-minute volume, last 3h (minute rollup) | 6 ms | 51 ms | 361 | 7.05 KiB |
+| Per-minute volume, last 3h (raw events) | 8 ms | 55 ms | 90,609 | 442.43 KiB |
+| Active merchants per minute, last 3h (uniqMerge) | 24 ms | 69 ms | 362 | 32.52 KiB |
+| One merchant's raw event history (primary key hit) | 8 ms | 52 ms | 28,960 | 370.80 KiB |
+| Anomaly watchlist, full view | 34 ms | 76 ms | 188,247 | 1.36 MiB |
+| Monthly volume, 25 months (daily rollup) | 12 ms | 57 ms | 381,047 | 9.45 MiB |
+| Daily failures, full history (daily rollup) | 10 ms | 57 ms | 381,047 | 3.63 MiB |
+| Full RFM segmentation, computed live | 41 ms | 70 ms | 384,076 | 13.09 MiB |
 
 What the numbers show, honestly:
 
-- **Full scans are cheap in a column store.** The monthly rollup aggregates all 575K rows in 8 ms because it reads three columns (5.49 MiB), not the table.
-- **Partition pruning works.** The Q1 2026 query read 114,831 rows, roughly 3 months out of 24, before any filtering. The monthly partition key did that, not the WHERE clause.
-- **The sparse index reads granules, not rows.** The single merchant query matched about 1,200 rows but read 171,872: MergeTree indexes every 8,192nd row, so it reads one whole granule per monthly partition where the merchant appears. At this scale that looks like overhead; at billions of rows it is exactly the mechanism that keeps merchant queries from scanning everything.
-- **The materialized view does not pay off at 575K rows**, and the numbers say so: 5 ms via the MV against 6 ms against the base table. Its value is structural: the aggregate table grows with merchants times days while the base table grows with traffic, so the gap widens with volume. Building the pattern correctly at small scale is the point.
-- **The live RFM segmentation is the most expensive query (24 ms)** because it joins, aggregates, and runs three window functions over the full table. Still comfortably interactive, which is why it stayed a plain view instead of another materialization.
+- **The minute rollup earns its keep in rows read.** The same per-minute answer costs 361 rows via the rollup against 90,609 via raw events, a 250x IO saving that grows linearly with traffic, even though both still finish in single digit milliseconds at this volume. The wall clock gap comes with scale; the IO gap is already real.
+- **Part pruning limits even the raw scan.** The 3 hour raw query read 90,609 of 657,686 rows without any help from the sort key (event_time is the second key column): ClickHouse skipped older parts entirely using per-part min/max metadata, because parts written by a stream are naturally time ordered.
+- **The sparse primary index works.** One merchant's full two-day history read 28,960 rows out of 657K: MergeTree reads whole 8,192 row granules around the merchant's contiguous runs rather than scanning the table.
+- **`uniqMerge` finalizes stored HyperLogLog states** from the AggregatingMergeTree in 24 ms; computing distinct merchants per minute from raw events on every dashboard refresh would re-scan the stream each time.
+- **The anomaly watchlist, the most complex query in the system** (a 15 minute raw window, a 7 day baseline union, a join to the dimension table, and a pooled two-proportion z test), runs in 34 ms on the server. This is why detection is a view instead of a pipeline: there is nothing to schedule, restart, or fall behind.
+- **Insert side:** the bulk backfill sustained ~197K rows/s in 100K batches. The live producer streams ~25 to 40 events/s (by design) with an observed ingestion lag of 1 to 6 seconds, and 657K streamed events sit in 8 active parts, which is the batching plus `async_insert` discipline doing its job.
+
+## End to end verification
+
+[scripts/verify_live.py](scripts/verify_live.py) checks the running system: TTL present in the DDL, events flowing (rate over a 45 s window), ingestion lag under 30 s, exact materialized view consistency (raw count = minute rollup sum = daily rollup sum), insert batching health (active part count), and that an injected anomaly burst is caught by the watchlist while it runs. The script identifies the burst merchant from the raw data itself (no natural merchant exceeds a 40% failure rate on 100+ events in 10 minutes), so detection is verified against ground truth rather than against the detector's own opinion.
+
+The first full run of this script is what exposed the watchlist precision problem described in the anomaly view comments (7 thin-baseline false positives beside the real burst), which is the point of running verification against a live stream instead of eyeballing a demo. After switching the detector to a pooled two-proportion z test at 3.5 sigma, the rerun passed 8 of 8:
+
+```
+PASS  TTL on events: 90 day TTL with ttl_only_drop_parts
+PASS  TTL on platform_minute_stats: 90 day TTL with ttl_only_drop_parts
+PASS  events flowing: 1431 events in 45s (31.8/s)
+PASS  ingestion lag: 2s behind wall clock (threshold 30s)
+PASS  materialized view consistency: events=633,618 minute_rollup=633,618 daily_rollup=633,618
+PASS  insert batching (active parts): 633,618 rows in 8 active parts
+PASS  anomaly detection: ground truth burst MCH100539 (73% over 106 events) is on the watchlist (watchlist size 1)
+PASS  watchlist precision: 1 merchants listed during burst (expect the burst plus at most stray 3 sigma noise)
+```
