@@ -21,6 +21,8 @@ services:
       - "9000:9000"   # native TCP interface: clickhouse-client for ad hoc queries
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      # Schema DDL, applied automatically on first start (empty data volume).
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
     ulimits:
       nofile:
         soft: 262144
