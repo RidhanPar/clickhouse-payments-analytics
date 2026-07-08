@@ -123,15 +123,20 @@ def build_query_context(dataset_id, params):
     does on save. Without it the /chart/{id}/data endpoint refuses to run."""
     if "x_axis" in params:
         columns = [axis_column(params["x_axis"], params.get("time_grain_sqla"))]
+    elif params.get("query_mode") == "raw":
+        columns = list(params.get("all_columns", []))
     else:
         columns = list(params.get("groupby", []))
     query = {
         "columns": columns,
-        "metrics": params["metrics"],
         "filters": [],
         "row_limit": params.get("row_limit", 10000),
         "extras": {"having": "", "where": ""},
     }
+    if params.get("metrics"):
+        query["metrics"] = params["metrics"]
+    if params.get("query_mode") == "raw" and params.get("order_by_cols"):
+        query["orderby"] = [json.loads(o) for o in params["order_by_cols"]]
     if params.get("time_grain_sqla"):
         query["extras"]["time_grain_sqla"] = params["time_grain_sqla"]
     if params.get("series_limit_metric"):
@@ -203,7 +208,9 @@ def main():
     ds_txn = ensure_dataset(api, db_id, "transactions")
     ds_daily = ensure_dataset(api, db_id, "daily_merchant_stats")
     ds_seg = ensure_dataset(api, db_id, "transactions_with_segments", sql=SEGMENT_DATASET_SQL)
-    print(f"Datasets ready: transactions={ds_txn}, daily_stats={ds_daily}, segments={ds_seg}")
+    ds_anom = ensure_dataset(api, db_id, "merchant_anomalies")
+    print(f"Datasets ready: transactions={ds_txn}, daily_stats={ds_daily}, "
+          f"segments={ds_seg}, anomalies={ds_anom}")
 
     charts = {}
 
@@ -254,6 +261,22 @@ def main():
             "row_limit": 10000,
         })
 
+    # The view computes and filters everything itself, so the chart is a raw
+    # read: whatever rows the view returns ARE the watchlist.
+    charts["anomalies"] = ensure_chart(
+        api, "Anomaly watchlist (failure rate vs merchant baseline)", ds_anom, "table", {
+            "query_mode": "raw",
+            "all_columns": ["merchant_id", "industry", "txns_15m", "failed_15m",
+                            "failure_rate_15m", "baseline_rate", "baseline_source",
+                            "z_score"],
+            "order_by_cols": ['["z_score", false]'],
+            "row_limit": 50,
+            "column_config": {
+                "failure_rate_15m": {"d3NumberFormat": ".2%"},
+                "baseline_rate": {"d3NumberFormat": ".2%"},
+            },
+        })
+
     print(f"Charts ready: {charts}")
 
     dash_id = api.find_one("dashboard", "dashboard_title", DASHBOARD_TITLE)
@@ -265,6 +288,7 @@ def main():
          chart_component(charts["daily_failures"], "Daily failed transactions", 6, 50)],
         [chart_component(charts["segments"], "Failure rate by merchant segment", 6, 50),
          chart_component(charts["top_merchants"], "Top merchants by processed volume", 6, 50)],
+        [chart_component(charts["anomalies"], "Anomaly watchlist", 12, 40)],
     ])
     dash_id = api.post("/dashboard/", {
         "dashboard_title": DASHBOARD_TITLE,
