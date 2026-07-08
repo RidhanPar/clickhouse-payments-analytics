@@ -1,11 +1,12 @@
 """
-Times the analytical queries behind the dashboard against ClickHouse.
+Times the analytical queries behind the live dashboards against ClickHouse,
+while the producer is streaming.
 
 Method: one warmup run per query (so all queries compete on the same page
 cache footing), then 5 timed runs, reporting the median wall time measured
 client side over HTTP. Rows and bytes read come from system.query_log, which
-records what the server actually scanned, so index and partition pruning
-effects are visible rather than guessed at.
+records what the server actually scanned, so partition pruning, primary key
+hits, and rollup savings are measured rather than asserted.
 
     py -3.11 scripts/benchmark.py
 
@@ -21,35 +22,41 @@ from ch import get_client
 RUNS = 5
 
 QUERIES = [
-    ("Monthly volume and value, full 24 months",
-     """SELECT toStartOfMonth(transaction_date) AS month,
-               count() AS txns, sum(amount) AS amount
-        FROM payments.transactions GROUP BY month ORDER BY month"""),
+    ("Per-minute volume, last 3h (minute rollup)",
+     """SELECT minute, sum(txn_count) AS txns, sum(failed_count) AS failed
+        FROM payments.platform_minute_stats
+        WHERE minute > now() - INTERVAL 3 HOUR
+        GROUP BY minute ORDER BY minute"""),
 
-    ("One merchant's daily history (primary key hit)",
-     """SELECT transaction_date, count() AS txns, sum(amount) AS amount
-        FROM payments.transactions
+    ("Per-minute volume, last 3h (raw events)",
+     """SELECT toStartOfMinute(event_time) AS minute,
+               count() AS txns, countIf(status = 'Failed') AS failed
+        FROM payments.events
+        WHERE event_time > now() - INTERVAL 3 HOUR
+        GROUP BY minute ORDER BY minute"""),
+
+    ("Active merchants per minute, last 3h (uniqMerge)",
+     """SELECT minute, uniqMerge(active_merchants) AS merchants
+        FROM payments.platform_minute_stats
+        WHERE minute > now() - INTERVAL 3 HOUR
+        GROUP BY minute ORDER BY minute"""),
+
+    ("One merchant's raw event history (primary key hit)",
+     """SELECT toStartOfHour(event_time) AS hour, count() AS txns, sum(amount) AS amount
+        FROM payments.events
         WHERE merchant_id = 'MCH102479'
-        GROUP BY transaction_date ORDER BY transaction_date"""),
+        GROUP BY hour ORDER BY hour"""),
 
-    ("Top 15 merchants by successful volume",
-     """SELECT merchant_id, sumIf(amount, status = 'Success') AS volume
-        FROM payments.transactions
-        GROUP BY merchant_id ORDER BY volume DESC LIMIT 15"""),
+    ("Anomaly watchlist, full view",
+     "SELECT * FROM payments.merchant_anomalies"),
 
-    ("Failure reasons in Q1 2026 (partition pruning)",
-     """SELECT failure_reason, count() AS failures
-        FROM payments.transactions
-        WHERE status = 'Failed'
-          AND transaction_date BETWEEN '2026-01-01' AND '2026-03-31'
-        GROUP BY failure_reason ORDER BY failures DESC"""),
+    ("Monthly volume, 25 months (daily rollup)",
+     """SELECT toStartOfMonth(day) AS month,
+               sum(txn_count) AS txns, sum(success_amount) AS amount
+        FROM payments.daily_merchant_stats
+        GROUP BY month ORDER BY month"""),
 
-    ("Daily failures from the base table",
-     """SELECT transaction_date, countIf(status = 'Failed') AS failed
-        FROM payments.transactions
-        GROUP BY transaction_date ORDER BY transaction_date"""),
-
-    ("Daily failures from the materialized view",
+    ("Daily failures, full history (daily rollup)",
      """SELECT day, sum(failed_count) AS failed
         FROM payments.daily_merchant_stats
         GROUP BY day ORDER BY day"""),
@@ -60,7 +67,7 @@ QUERIES = [
 ]
 
 
-def bench(client, label, sql):
+def bench(client, sql):
     tag = uuid.uuid4().hex
     tagged = f"{sql} -- bench:{tag}"
 
@@ -85,14 +92,18 @@ def bench(client, label, sql):
 
 def main():
     client = get_client()
-    total_rows = client.command("SELECT count() FROM payments.transactions")
-    print(f"Benchmarking against {total_rows:,} transactions, "
-          f"median of {RUNS} runs after warmup, wall time over HTTP.\n")
+    events, span_start, span_end = client.query(
+        "SELECT count(), min(event_time), max(event_time) FROM payments.events"
+    ).result_rows[0]
+    rollup = client.command("SELECT count() FROM payments.daily_merchant_stats")
+    print(f"Benchmarking while streaming: {events:,} raw events "
+          f"({span_start} to {span_end}), {rollup:,} daily rollup rows "
+          f"(24 months history + live). Median of {RUNS} runs after warmup.\n")
 
     print("| Query | Server execution | End to end (HTTP) | Rows read | Data read |")
     print("|---|---|---|---|---|")
     for label, sql in QUERIES:
-        wall_ms, server_ms, read_rows, read_bytes = bench(client, label, sql)
+        wall_ms, server_ms, read_rows, read_bytes = bench(client, sql)
         print(f"| {label} | {server_ms:.0f} ms | {wall_ms:.0f} ms "
               f"| {read_rows:,} | {read_bytes} |")
 
