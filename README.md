@@ -84,7 +84,18 @@ python scripts/build_dashboard.py   # build all three dashboards, or import supe
 python scripts/verify_live.py       # optional: prove the whole thing works end to end
 ```
 
-Superset runs at http://localhost:8088 (admin / admin_local unless changed in `.env`). The producer starts streaming as soon as the backfill gives it a merchant book; it waits and retries until then, so start order does not matter. Producer rate, flush interval, and anomaly cadence are tunable in `.env` (see `.env.example`).
+Superset runs at http://localhost:8088. The producer starts streaming as soon as the backfill gives it a merchant book; it waits and retries until then, so start order does not matter. Producer rate, flush interval, and anomaly cadence are tunable in `.env` (see `.env.example`).
+
+### Default credentials
+
+These are the local development defaults, used unless overridden in `.env`:
+
+| Service | URL | Username | Password |
+|---|---|---|---|
+| Superset UI | http://localhost:8088 | `admin` | `admin_local` |
+| ClickHouse (HTTP 8123 / native 9000) | http://localhost:8123 | `analytics` | `analytics_local` |
+
+They are safe as defaults only because every port binds to localhost. For anything shared, copy `.env.example` to `.env` and set real values before the first `docker compose up`.
 
 ## The data
 
