@@ -1,72 +1,116 @@
-# Payments Analytics on ClickHouse and Apache Superset
+# Live Payments Analytics on ClickHouse and Apache Superset
 
-A local real-time analytics stack: ClickHouse as the analytical database, Apache Superset as the BI layer, wired together with Docker Compose. The dataset is a simulated payments portfolio of about 575K transactions across 3,000 merchants over 24 months, reused from my [payment-merchant-clv-segmentation](https://github.com/RidhanPar/payment-merchant-clv-segmentation) project.
+A running analytics system, not a static demo: a producer service streams payment events around the clock into ClickHouse, materialized views maintain per-minute and per-merchant aggregates as data arrives, an anomaly detector flags merchants whose failure rate breaks from their own baseline, and Superset serves three dashboards on top, including an operations view that refreshes itself every 30 seconds. Everything runs locally on Docker Compose.
 
-Built in stages, one pull request per stage:
+The dataset is a simulated acquiring portfolio: 3,000 merchants with individual ticket sizes, activity rates, and decline rates, carrying 24 months of seeded history (reused from my [payment-merchant-clv-segmentation](https://github.com/RidhanPar/payment-merchant-clv-segmentation) project) plus a live stream of ~25 to 40 events per second with daily volume cycles and injected failure bursts.
 
-1. Docker Compose stack and setup documentation
-2. ClickHouse schema (MergeTree table, materialized view)
-3. Batched data load
-4. Superset dashboard, exported and committed
-5. Query benchmarks
+Built in 12 pull requests, one per stage, each merged after review. The interesting decisions and the failures that shaped them are documented where they live: [docs/SETUP.md](docs/SETUP.md) for the stack, [docs/SCHEMA.md](docs/SCHEMA.md) for the tables, [docs/OPERATIONS.md](docs/OPERATIONS.md) for running it.
 
-## Why ClickHouse for this workload
+## Architecture
 
-The dashboard queries share one shape: scan hundreds of thousands of transaction rows, touch 3 or 4 of the 7 columns, aggregate by merchant or by time. A row store reads every column of every row to answer that; a columnar engine reads only the columns the query names, and because each column is stored sorted and together, it compresses to a fraction of its raw size (this table: 6.41 MiB on disk for 575K rows, 2.4x under the raw bytes). Add MergeTree's sparse primary index and partition pruning and the result is single digit millisecond aggregations with no pre-computed cubes, no query cache warming, and no indexes to hand tune per dashboard filter.
+```mermaid
+flowchart LR
+    subgraph generation [Data generation]
+        P[producer service<br>~25 to 40 events/s<br>daily cycle, anomaly bursts]
+        B[backfill_history.py<br>24 months, run once]
+    end
 
-The trade is that ClickHouse is bad at what OLTP databases are good at: point lookups, updates, deletes, high concurrency small transactions. Nothing in a BI workload needs those, which is why the pairing with Superset works: Superset generates exactly the aggregate heavy, low concurrency SQL that ClickHouse eats.
+    subgraph clickhouse [ClickHouse 24.8]
+        E[(events<br>MergeTree, raw stream<br>TTL 90 days)]
+        M[(platform_minute_stats<br>AggregatingMergeTree<br>TTL 90 days)]
+        D[(daily_merchant_stats<br>SummingMergeTree<br>kept forever)]
+        DIM[(merchants<br>dimension, 3,000 rows)]
+        SEG[/merchant_segments<br>RFM view/]
+        ANOM[/merchant_anomalies<br>z test view/]
+    end
 
-## Quick start
+    subgraph superset [Superset 5.0]
+        OPS[Operations dashboard<br>auto refresh 30s]
+        HIST[History dashboard]
+        MON[System Monitoring<br>auto refresh 30s]
+    end
+
+    P -- batched async inserts --> E
+    B -- seeds --> D
+    B -- seeds --> DIM
+    E -- MV per insert --> M
+    E -- MV per insert --> D
+    D --> SEG
+    DIM --> SEG
+    E --> ANOM
+    D --> ANOM
+    DIM --> ANOM
+    M --> OPS
+    E --> OPS
+    ANOM --> OPS
+    D --> HIST
+    SEG --> HIST
+    M --> MON
+    E --> MON
+```
+
+The storage contract in one sentence: raw events grow with traffic and expire after 90 days, the daily rollup grows only with merchants times days and is the permanent record, and everything long term reads the rollup.
+
+## Why ClickHouse for streaming analytics
+
+The workload is: events arrive continuously, and every question is an aggregate over many rows and few columns, either "right now" (last minutes to hours) or "over time" (months to years). ClickHouse fits this shape for three reasons that go beyond generic column store points:
+
+- **Columnar reads with a sparse primary index.** Queries read only the columns they name, compressed; the index stores one entry per 8,192 row granule, so per merchant queries read the merchant's contiguous runs instead of the table. Measured below: one merchant's full history costs 29K rows read out of 657K.
+- **The merge machinery does the operational work.** Background merges are the same mechanism that compacts small parts, applies the 90 day TTL (dropping whole expired parts), and folds materialized view partials into rollups. Retention and real time aggregation are not extra systems to run; they are properties of tables.
+- **Insert batching is the one discipline the writer must keep.** Every insert becomes an immutable part, so the producer buffers 5 seconds of events per insert and sets `async_insert` so the server coalesces further. Result: 657K streamed events in 8 active parts.
+
+The trade: ClickHouse is bad at what OLTP databases are good at (point updates, deletes, high concurrency small transactions). A payments analytics pipeline needs none of those, and Superset generates exactly the aggregate heavy, low concurrency SQL that ClickHouse eats.
+
+## Table engines, and why each one
+
+| Table | Engine | Why this engine |
+|---|---|---|
+| `events` | MergeTree | Immutable facts, inserted once, never updated. The base engine is the correct default; anything fancier would need justifying. |
+| `platform_minute_stats` | AggregatingMergeTree | One metric (distinct active merchants per minute) cannot merge by addition; it needs stored `uniq` state, read back with `uniqMerge`. Plain sums ride along as `SimpleAggregateFunction` columns. |
+| `daily_merchant_stats` | SummingMergeTree | Every column is a count or sum, which merge by plain addition. The simpler engine wins where nothing needs aggregate state. |
+| `merchant_segments`, `merchant_anomalies` | plain views | 3,000 output rows and a 15 minute window respectively; computing live costs milliseconds and there is nothing to keep fresh. |
+
+Sort keys, partitioning, TTL mechanics, and the two materialized view traps (they never re-read existing data, and their targets must be read with re-aggregation) are reasoned through in [docs/SCHEMA.md](docs/SCHEMA.md).
+
+## Run it
 
 ```bash
 git clone https://github.com/RidhanPar/clickhouse-payments-analytics.git
 cd clickhouse-payments-analytics
-docker compose up -d --build      # ClickHouse + Superset + metadata DB, schema auto-applied
+docker compose up -d --build        # ClickHouse, Superset, metadata DB, producer; schema auto-applied
 pip install -r requirements.txt
-python scripts/backfill_history.py # seed merchants + 24 months of daily history
-python scripts/build_dashboard.py  # create charts + dashboard, or import the committed export
+python scripts/backfill_history.py  # seed merchants + 24 months of history (run before the producer has data to stream against)
+python scripts/build_dashboard.py   # build all three dashboards, or import superset/exports/payments_dashboards.zip
+python scripts/verify_live.py       # optional: prove the whole thing works end to end
 ```
 
-Superset then runs at http://localhost:8088 (admin / admin_local). [docs/SETUP.md](docs/SETUP.md) documents every configuration choice in the stack; [docs/SCHEMA.md](docs/SCHEMA.md) explains the table design.
+Superset runs at http://localhost:8088 (admin / admin_local unless changed in `.env`). The producer starts streaming as soon as the backfill gives it a merchant book; it waits and retries until then, so start order does not matter. Producer rate, flush interval, and anomaly cadence are tunable in `.env` (see `.env.example`).
 
-## Dataset and load
+## The data
 
-The generator is copied unchanged from the segmentation project (seeded with `numpy` seed 42, so every run produces the identical dataset): 3,000 merchants with lognormal ticket sizes and activity rates, industry dependent decline rates, and a churned subset, producing 575,226 transactions across 24 months.
+History: the seeded generator produces 575,226 transactions across 24 months with lognormal ticket sizes and activity rates, industry dependent decline rates, and a churned subset. The backfill aggregates it to daily grain and loads it into the rollup at ~197K rows/s (raw history would just be TTL fodder; the storage split is the point).
 
-```bash
-pip install -r requirements.txt
-py -3.11 scripts/backfill_history.py
-```
+Live stream: the producer gives each merchant a personality from the dimension table and weights traffic by each merchant's trailing 90 day volume, so churned merchants stay churned (learned the hard way; the first version resurrected the whole book and broke recency segmentation, documented in SCHEMA.md). Volume follows a daily cycle, failures follow per merchant decline rates, and roughly every 15 minutes one merchant bursts to a 55 to 80 percent failure rate for a few minutes, logged as ground truth for the detector.
 
-The backfill generates the data in memory, aggregates it to daily grain, and inserts it over the HTTP interface in 100K row batches (raw history would be deleted by the 90 day TTL on events, so history is seeded into the rollup table; docs/SCHEMA.md explains the storage split). Batching matters in ClickHouse: every insert becomes an immutable part on disk, so small frequent inserts create part counts that stall background merges. The load verifies transaction counts against the generator afterwards.
+## Dashboards
 
-Measured on this machine (Docker Desktop on Windows, ClickHouse 24.8):
+Three dashboards, built as code by [scripts/build_dashboard.py](scripts/build_dashboard.py) through the Superset REST API and exported to [superset/exports/payments_dashboards.zip](superset/exports/payments_dashboards.zip) (imports prompt for the ClickHouse password; Superset masks it in exports).
 
-| Metric | Value |
-|---|---|
-| Transactions loaded | 575,226 |
-| Merchants loaded | 3,000 |
-| Insert wall time | 2.92 s |
-| Insert throughput | ~197,000 rows/s |
-| Overall failure rate | 6.74% |
-| On-disk size (transactions) | 6.41 MiB compressed (15.14 MiB uncompressed) |
+| Dashboard | Refresh | Reads | Shows |
+|---|---|---|---|
+| Payments Operations (Live) | 30 s | minute rollup, raw events, anomaly view | per minute volume and failure rate (3h), active merchants, top merchants (24h), anomaly watchlist |
+| Payments History | manual | daily rollup, segment views | monthly volume, daily failures, failure rate by RFM segment, lifetime top merchants, segment sizes |
+| System Monitoring | 30 s | minute rollup, raw events, system.parts | ingestion rate, ingestion lag, active parts and size per table |
 
-The materialized view target ends up with 372,370 rows against 575,226 in the base table, a modest 1.5x reduction at this data density (many merchants transact less than daily). The reduction grows with volume; the point of the pattern is that the aggregate table grows with merchants times days while the base table grows with transactions.
+The history dashboard touches nothing but rollups, so it stays fast forever regardless of stream volume and is unaffected by raw retention.
 
-## Dashboard
+## Anomaly detection
 
-The "Payments Portfolio Overview" dashboard recreates the core views from the segmentation project as Superset charts running directly on ClickHouse:
+`merchant_anomalies` is a view, not a pipeline: every dashboard refresh recomputes it in ~34 ms. It flags merchants whose failure rate over the last 15 minutes sits 3.5+ standard deviations (pooled two-proportion z test) and 5+ absolute points above their own baseline, where the baseline is the merchant's observed trailing 7 days when thick enough and its configured decline rate otherwise. Both refinements exist because earlier versions produced real false positives against the live stream; the SQL comments in [clickhouse/init/06_merchant_anomalies.sql](clickhouse/init/06_merchant_anomalies.sql) tell that story, and the verification section below shows the detector catching an injected burst with zero noise.
 
-| Chart | Source | Query shape |
-|---|---|---|
-| Transaction volume over time | `transactions` | monthly `count(*)` |
-| Failure rate by merchant segment | virtual dataset joining `transactions` to the `merchant_segments` view | `countIf(status = 'Failed') / count(*)` per segment |
-| Top merchants by processed volume | `transactions` | `sumIf(amount, status = 'Success')` per merchant, top 15 |
-| Daily failed transactions | `daily_merchant_stats` (materialized view target) | `sum(failed_count)` per day, aggregating again at read time as SummingMergeTree requires |
+## Screenshots
 
-The dashboard is built by [scripts/build_dashboard.py](scripts/build_dashboard.py) through the Superset REST API, so the entire definition is reviewable code, and the result is exported to [superset/exports/payments_portfolio_dashboard.zip](superset/exports/payments_portfolio_dashboard.zip). To reproduce on a fresh stack, either re-run the script or import the zip in the Superset UI (Dashboards, Import). Superset masks database passwords in exports, so an import prompts for the ClickHouse password (`analytics_local` unless changed in `.env`).
-
-Screenshots: to be added under `docs/img/` after review.
+To be added under `docs/img/` after review: operations dashboard mid-burst, history dashboard, monitoring dashboard.
 
 ## Benchmarks (measured on the running system)
 
@@ -108,3 +152,9 @@ PASS  insert batching (active parts): 633,618 rows in 8 active parts
 PASS  anomaly detection: ground truth burst MCH100539 (73% over 106 events) is on the watchlist (watchlist size 1)
 PASS  watchlist precision: 1 merchants listed during burst (expect the burst plus at most stray 3 sigma noise)
 ```
+
+## Documentation map
+
+- [docs/SETUP.md](docs/SETUP.md): every configuration choice in the Compose stack, image pinning, ports, volumes, secrets, the Superset bootstrap, and the driver installation trap in the Superset 5 image.
+- [docs/SCHEMA.md](docs/SCHEMA.md): the storage strategy, sort keys, partitioning, TTL mechanics, engine choices, and the segmentation fixes that live data forced.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): health triage, data flow checks, system table queries with observed healthy values, TTL behavior, tested backup and restore, and failure modes seen while building.
