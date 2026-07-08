@@ -23,8 +23,8 @@ git clone https://github.com/RidhanPar/clickhouse-payments-analytics.git
 cd clickhouse-payments-analytics
 docker compose up -d --build      # ClickHouse + Superset + metadata DB, schema auto-applied
 pip install -r requirements.txt
-python scripts/load_data.py       # generate and load 575K transactions
-python scripts/build_dashboard.py # create charts + dashboard, or import the committed export
+python scripts/backfill_history.py # seed merchants + 24 months of daily history
+python scripts/build_dashboard.py  # create charts + dashboard, or import the committed export
 ```
 
 Superset then runs at http://localhost:8088 (admin / admin_local). [docs/SETUP.md](docs/SETUP.md) documents every configuration choice in the stack; [docs/SCHEMA.md](docs/SCHEMA.md) explains the table design.
@@ -35,10 +35,10 @@ The generator is copied unchanged from the segmentation project (seeded with `nu
 
 ```bash
 pip install -r requirements.txt
-py -3.11 scripts/load_data.py
+py -3.11 scripts/backfill_history.py
 ```
 
-The script generates the data in memory and inserts it over the HTTP interface in 100K row batches. Batching matters in ClickHouse: every insert becomes an immutable part on disk, so small frequent inserts create part counts that stall background merges. The load also verifies afterwards that the materialized view row counts match the base table.
+The backfill generates the data in memory, aggregates it to daily grain, and inserts it over the HTTP interface in 100K row batches (raw history would be deleted by the 90 day TTL on events, so history is seeded into the rollup table; docs/SCHEMA.md explains the storage split). Batching matters in ClickHouse: every insert becomes an immutable part on disk, so small frequent inserts create part counts that stall background merges. The load verifies transaction counts against the generator afterwards.
 
 Measured on this machine (Docker Desktop on Windows, ClickHouse 24.8):
 

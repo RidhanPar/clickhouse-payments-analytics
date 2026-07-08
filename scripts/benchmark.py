@@ -16,7 +16,7 @@ import statistics
 import time
 import uuid
 
-from load_data import get_client
+from ch import get_client
 
 RUNS = 5
 
