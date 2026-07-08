@@ -1,0 +1,94 @@
+# Local analytics stack: ClickHouse (analytical database) + Apache Superset (BI layer).
+# Every configuration choice here is explained in docs/SETUP.md.
+
+x-superset-env: &superset-env
+  SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-dev_only_change_me_in_env_file}
+  SUPERSET_METADATA_DB_URI: postgresql+psycopg2://superset:${POSTGRES_PASSWORD:-superset_metadata_local}@superset-metadata-db:5432/superset
+  SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
+  SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin_local}
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: payments-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: payments
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analytics_local}
+    ports:
+      - "8123:8123"   # HTTP interface: Superset driver and the Python load script
+      - "9000:9000"   # native TCP interface: clickhouse-client for ad hoc queries
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  superset-metadata-db:
+    image: postgres:15-alpine
+    container_name: superset-metadata-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: superset
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-superset_metadata_local}
+    # No host port mapping on purpose: only Superset needs this database,
+    # and it reaches it over the Compose network by service name.
+    volumes:
+      - superset_metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset -d superset"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot bootstrap: migrates the metadata schema, creates the admin user,
+  # seeds default roles and permissions, then exits. Safe to re-run.
+  superset-init:
+    build: ./superset
+    container_name: superset-init
+    environment: *superset-env
+    depends_on:
+      superset-metadata-db:
+        condition: service_healthy
+    volumes:
+      - superset_home:/app/superset_home
+    command: >
+      bash -c "superset db upgrade &&
+      (superset fab create-admin
+      --username \"$$SUPERSET_ADMIN_USERNAME\"
+      --password \"$$SUPERSET_ADMIN_PASSWORD\"
+      --firstname Admin --lastname User --email admin@localhost || true) &&
+      superset init"
+
+  superset:
+    build: ./superset
+    container_name: payments-superset
+    restart: unless-stopped
+    environment: *superset-env
+    ports:
+      - "8088:8088"   # Superset web UI and REST API
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - superset_home:/app/superset_home
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  clickhouse_data:
+  superset_metadata:
+  superset_home:
