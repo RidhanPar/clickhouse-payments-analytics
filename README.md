@@ -110,7 +110,19 @@ The history dashboard touches nothing but rollups, so it stays fast forever rega
 
 ## Screenshots
 
-To be added under `docs/img/` after review: operations dashboard mid-burst, history dashboard, monitoring dashboard.
+Captured from the running stack (scripted with Playwright; the stream had been running for two days).
+
+**Payments Operations (Live)**, auto refreshing every 30 seconds. The anomaly watchlist at the bottom caught an injected burst in real time: MCH100539 at a 76% failure rate over 274 events against its 40% observed baseline, z of 10.4.
+
+![Operations dashboard with the anomaly watchlist populated during a burst](docs/img/operations-dashboard.png)
+
+**Payments History**, reading only the daily rollup and segment views. The July 2026 spike is the two days of dense live streaming folded into the daily grain alongside the 24 months of seeded history.
+
+![History dashboard](docs/img/history-dashboard.png)
+
+**System Monitoring**: ingestion rate per minute, ingestion lag as a single number (6 seconds behind wall clock here), and active parts per table. The events table holds 690K rows in 5 active parts, which is the insert batching discipline made visible.
+
+![System monitoring dashboard showing ingestion lag and part counts](docs/img/monitoring-dashboard.png)
 
 ## Benchmarks (measured on the running system)
 
